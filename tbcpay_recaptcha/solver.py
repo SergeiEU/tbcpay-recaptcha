@@ -44,7 +44,7 @@ class RecaptchaSolver:
         self.page = None
         self._last_token = None
         self._token_timestamp = None
-        self._site_key = None  # will be auto-detected from the page
+        self._site_key = self.RECAPTCHA_SITE_KEY_FALLBACK  # start with fallback, auto-detect on error
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -66,10 +66,7 @@ class RecaptchaSolver:
         self.page = await self.browser.get(self.TBCPAY_URL)
         await asyncio.sleep(3)  # give reCAPTCHA time to initialize
 
-        # Auto-detect reCAPTCHA site key from page
-        await self._detect_site_key()
-
-        logger.info("Ready")
+        logger.info("Ready (using fallback site key)")
 
     async def _detect_site_key(self):
         """Extract reCAPTCHA site key from the page source."""
@@ -157,7 +154,7 @@ class RecaptchaSolver:
             self.page = None
             self._last_token = None
             self._token_timestamp = None
-            self._site_key = None
+            self._site_key = self.RECAPTCHA_SITE_KEY_FALLBACK  # reset to fallback
 
     async def get_token(self, action: str = "payment", force_new: bool = False) -> Optional[str]:
         """
@@ -175,11 +172,25 @@ class RecaptchaSolver:
             logger.info(f"Using cached token ({age}s old)")
             return self._last_token
 
-        try:
-            logger.info("Getting fresh token...")
+        # Try to get token with current site key
+        token = await self._try_get_token(action)
 
-            # Use auto-detected site key
-            site_key = self._site_key or self.RECAPTCHA_SITE_KEY_FALLBACK
+        # If failed and using fallback key, try auto-detecting
+        if token is None and self._site_key == self.RECAPTCHA_SITE_KEY_FALLBACK:
+            logger.warning("Failed with fallback key, trying to auto-detect site key...")
+            await self._detect_site_key()
+
+            # Retry with detected key if it's different
+            if self._site_key != self.RECAPTCHA_SITE_KEY_FALLBACK:
+                logger.info("Retrying with auto-detected key...")
+                token = await self._try_get_token(action)
+
+        return token
+
+    async def _try_get_token(self, action: str) -> Optional[str]:
+        """Try to get a reCAPTCHA token with current site key."""
+        try:
+            logger.info(f"Getting fresh token with site key: {self._site_key[:20]}...")
 
             # Execute reCAPTCHA and get token using CDP
             execute_script = f"""
@@ -197,7 +208,7 @@ class RecaptchaSolver:
                 }}
 
                 // Execute reCAPTCHA
-                const token = await grecaptcha.execute('{site_key}', {{action: '{action}'}});
+                const token = await grecaptcha.execute('{self._site_key}', {{action: '{action}'}});
                 return token;
             }})()
             """
