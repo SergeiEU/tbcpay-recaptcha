@@ -38,7 +38,7 @@ class TBCPayService:
             'Referer': 'https://tbcpay.ge/',
             'Accept-Language': 'en-US,en;q=0.9',
             'Lang': 'en-US',
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
         })
 
     async def _ensure_solver(self):
@@ -47,25 +47,32 @@ class TBCPayService:
             self._solver = RecaptchaSolver(headless=self.headless)
             await self._solver.start()
 
-    async def get_token_async(self) -> Optional[str]:
-        """Gets a reCAPTCHA token (might use cached one)."""
+    async def get_token_async(self, force_new: bool = False) -> Optional[str]:
+        """Gets a reCAPTCHA token.
+
+        force_new: if True, always get a fresh token instead of using cached one
+        """
         await self._ensure_solver()
-        return await self._solver.get_token(action="payment")
+        return await self._solver.get_token(action="payment", force_new=force_new)
 
     async def check_balance_async(
         self,
         account_id: str,
-        step_order: int = 2
+        step_order: int = 2,
+        extra_context: list = None,
+        root_service_id: int = None
     ) -> Dict:
         """
         Checks your account balance.
 
         account_id: your account number
         step_order: usually 2, but CityCom uses 1 for some reason
+        extra_context: additional context parameters for specific services
+        root_service_id: override ROOT_SERVICE_ID if different from service_id
         """
         try:
-            # Get reCAPTCHA token
-            token = await self.get_token_async()
+            # Get fresh reCAPTCHA token for each request (force_new=True)
+            token = await self.get_token_async(force_new=True)
             if not token:
                 return {
                     'account_id': account_id,
@@ -74,13 +81,22 @@ class TBCPayService:
                     'error': 'Failed to get reCAPTCHA token'
                 }
 
+            # Build context
+            # Use root_service_id if provided, otherwise use service_id
+            root_id = root_service_id if root_service_id is not None else self.service_id
+            context = [
+                {"key": "ROOT_SERVICE_ID", "value": str(root_id)},
+                {"key": "abonentCode", "value": str(account_id)}
+            ]
+
+            # Add extra context if provided
+            if extra_context:
+                context.extend(extra_context)
+
             # Make API request
             url = f"{self.API_BASE_URL}/api/Service/GetNextSteps"
             payload = {
-                "context": [
-                    {"key": "ROOT_SERVICE_ID", "value": str(self.service_id)},
-                    {"key": "abonentCode", "value": str(account_id)}
-                ],
+                "context": context,
                 "recaptchaToken": token,
                 "serviceId": self.service_id,
                 "stepOrder": step_order,

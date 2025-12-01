@@ -7,6 +7,7 @@ start it over and over.
 
 import asyncio
 import logging
+import re
 import time
 from typing import Optional
 
@@ -27,7 +28,7 @@ class RecaptchaSolver:
     """
 
     TBCPAY_URL = "https://tbcpay.ge"
-    RECAPTCHA_SITE_KEY = "6LeYsrYZAAAAAMhY05m7_AIPPftm2v0AgNl2nloP"
+    RECAPTCHA_SITE_KEY_FALLBACK = "6LeYsrYZAAAAAMhY05m7_AIPPftm2v0AgNl2nloP"  # fallback if auto-detection fails
     TOKEN_LIFETIME = 110  # tokens last about 2 minutes, use 110s to be safe
     TIMEOUT = 30
 
@@ -43,6 +44,7 @@ class RecaptchaSolver:
         self.page = None
         self._last_token = None
         self._token_timestamp = None
+        self._site_key = None  # will be auto-detected from the page
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -63,7 +65,88 @@ class RecaptchaSolver:
         logger.info(f"Loading {self.TBCPAY_URL}...")
         self.page = await self.browser.get(self.TBCPAY_URL)
         await asyncio.sleep(3)  # give reCAPTCHA time to initialize
+
+        # Auto-detect reCAPTCHA site key from page
+        await self._detect_site_key()
+
         logger.info("Ready")
+
+    async def _detect_site_key(self):
+        """Extract reCAPTCHA site key from the page source."""
+        try:
+            # Method 1: Try to get site key directly from window.grecaptcha
+            try:
+                js_key = await self.page.send(zd.cdp.runtime.evaluate(
+                    expression="""
+                    (() => {
+                        // Try to find site key in window or grecaptcha object
+                        if (window.grecaptcha && window.grecaptcha.enterprise) {
+                            return window.grecaptcha.enterprise.sitekey;
+                        }
+                        // Search in all script tags
+                        const scripts = Array.from(document.scripts);
+                        for (const script of scripts) {
+                            const content = script.innerHTML || script.src;
+                            const match = content.match(/6[A-Za-z0-9_-]{38,}/);
+                            if (match) return match[0];
+                        }
+                        return null;
+                    })()
+                    """,
+                    return_by_value=True
+                ))
+
+                result, exception = js_key if isinstance(js_key, tuple) else (js_key, None)
+                if not exception and result and hasattr(result, 'value') and result.value:
+                    key = result.value
+                    if len(key) > 30 and key.startswith('6'):
+                        self._site_key = key
+                        logger.info(f"Auto-detected reCAPTCHA site key from JS: {key[:20]}...")
+                        return
+            except Exception as e:
+                logger.debug(f"JS detection method failed: {e}")
+
+            # Method 2: Parse HTML source
+            page_source = await self.page.send(zd.cdp.runtime.evaluate(
+                expression="document.documentElement.outerHTML",
+                return_by_value=True
+            ))
+
+            result, exception = page_source if isinstance(page_source, tuple) else (page_source, None)
+
+            if exception or not result or not hasattr(result, 'value'):
+                logger.warning("Failed to get page source for site key detection")
+                self._site_key = self.RECAPTCHA_SITE_KEY_FALLBACK
+                return
+
+            html = result.value
+
+            # Try multiple patterns to find the site key
+            patterns = [
+                r'6[A-Za-z0-9_-]{38,}',  # Generic reCAPTCHA key pattern
+                r'grecaptcha\.execute\([\'"]([^"\']+)[\'"]',  # grecaptcha.execute('KEY')
+                r'data-sitekey=[\'"]([^"\']+)[\'"]',  # data-sitekey="KEY"
+                r'sitekey[\'"]?\s*:\s*[\'"]([^"\']+)[\'"]',  # sitekey: "KEY"
+                r'render[\'"]?\s*:\s*[\'"]([^"\']+)[\'"]',  # render: "KEY"
+            ]
+
+            for pattern in patterns:
+                match = re.search(pattern, html, re.IGNORECASE)
+                if match:
+                    detected_key = match.group(1) if match.lastindex else match.group(0)
+                    # Validate format (reCAPTCHA keys start with 6 and are ~40 chars)
+                    if len(detected_key) > 30 and detected_key.startswith('6'):
+                        self._site_key = detected_key
+                        logger.info(f"Auto-detected reCAPTCHA site key from HTML: {detected_key[:20]}...")
+                        return
+
+            # If no key found, use fallback
+            logger.warning("Could not auto-detect site key, using fallback")
+            self._site_key = self.RECAPTCHA_SITE_KEY_FALLBACK
+
+        except Exception as e:
+            logger.error(f"Error detecting site key: {e}")
+            self._site_key = self.RECAPTCHA_SITE_KEY_FALLBACK
 
     async def stop(self):
         """Stop the browser instance."""
@@ -74,6 +157,7 @@ class RecaptchaSolver:
             self.page = None
             self._last_token = None
             self._token_timestamp = None
+            self._site_key = None
 
     async def get_token(self, action: str = "payment", force_new: bool = False) -> Optional[str]:
         """
@@ -94,6 +178,9 @@ class RecaptchaSolver:
         try:
             logger.info("Getting fresh token...")
 
+            # Use auto-detected site key
+            site_key = self._site_key or self.RECAPTCHA_SITE_KEY_FALLBACK
+
             # Execute reCAPTCHA and get token using CDP
             execute_script = f"""
             (async () => {{
@@ -110,7 +197,7 @@ class RecaptchaSolver:
                 }}
 
                 // Execute reCAPTCHA
-                const token = await grecaptcha.execute('{self.RECAPTCHA_SITE_KEY}', {{action: '{action}'}});
+                const token = await grecaptcha.execute('{site_key}', {{action: '{action}'}});
                 return token;
             }})()
             """
